@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <ostream>
 #include <random>
 #include <thread>
 #include "mutexes.hpp"
@@ -21,13 +22,23 @@ int nthreads;
 std::atomic<bool> should_end;
 std::vector<std::unique_ptr<abstractLock>> vlocks;
 
-constexpr size_t buf_sz = 1<<27 / 8; // 128 MiB on doubles
-CACHE_ALIGNED double *mem_empty[2];
+constexpr size_t buf_sz = (1ULL)<<34 / 8; // 8 GiB on doubles
+CACHE_ALIGNED volatile double *mem_empty[2];
 
 size_t val = 0;
 
-void thread_run(std::chrono::time_point<CLK_TYPE> start)
+void thread_run(int cpu, std::chrono::time_point<CLK_TYPE> start)
 {
+    // Create a cpu_set_t object representing a set of CPUs. Clear it and mark
+    // only CPU i as set.
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu, &cpuset);
+    int rc = pthread_setaffinity_np(pthread_self(),
+                                    sizeof(cpu_set_t), &cpuset);
+    if (rc != 0)
+        perror("Could not set affinity to thread");
+
     std::random_device rd;  // a seed source for the random number engine
     std::mt19937 gen(rd());
     std::uniform_int_distribution<size_t> dist(0, NLOCKS-1);
@@ -42,8 +53,18 @@ void thread_run(std::chrono::time_point<CLK_TYPE> start)
     }
 }
 
-void thread_copier()
+void thread_copier(int cpu)
 {
+    // Create a cpu_set_t object representing a set of CPUs. Clear it and mark
+    // only CPU i as set.
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu, &cpuset);
+    int rc = pthread_setaffinity_np(pthread_self(),
+        sizeof(cpu_set_t), &cpuset);
+    if (rc != 0)
+        perror("Could not set affinity to thread");
+
     int src = 0;
     int dest = 0;
     double total_bytes = 0;
@@ -52,7 +73,10 @@ void thread_copier()
     
     while (val < ITERATIONS * nthreads) {
         auto t1 = CLK_TYPE::now();
-        std::memcpy(mem_empty[dest], mem_empty[src], buf_sz * 8);
+        //std::memcpy(mem_empty[dest], mem_empty[src], buf_sz * 8);
+        for (size_t i = 0; i < buf_sz; i++) {
+            mem_empty[dest][i] = mem_empty[src][i];
+        }
         auto t2 = CLK_TYPE::now();
         
         auto copy_time = std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1);
@@ -81,15 +105,15 @@ int main ()
     if (ret == -1)
         perror("Error in sched_getaffinity()");
 
+
     nthreads = CPU_COUNT(&proc_cpus);
     std::cout << "Allowed CPUs: ";
     for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
         if (CPU_ISSET(cpu, &proc_cpus))
             std::cout << cpu << " ";
     }
+    std::cout << std::endl << std::flush;
 
-    // Atomic to signal when to finish
-    should_end.store(false);
 
     mem_empty[0] = new double[buf_sz];
     mem_empty[1] = new double[buf_sz];
@@ -107,10 +131,15 @@ int main ()
 
     std::vector<std::thread> vthr;
     vthr.reserve(nthreads);
-    for (int i = 0; i < nthreads; i++)
-        vthr.emplace_back(thread_run, start);
+    int last_cpu = -1;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        if (CPU_ISSET(cpu, &proc_cpus)) {
+            last_cpu = cpu;
+            vthr.emplace_back(thread_run, cpu, start);
+        }
+    }
 
-    std::thread copier(thread_copier);
+    std::thread copier(thread_copier, last_cpu+1);
 
     for (int i = 0; i < nthreads; i++)
         vthr[i].join();
@@ -119,5 +148,5 @@ int main ()
     copier.join();
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    std::cout << "\nTime measured: " << duration.count() << " ms" << std::endl;
+    std::cout << "cpus " << nthreads << " time " << duration.count() << " ms" << std::endl << std::endl;
 }
