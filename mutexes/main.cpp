@@ -4,48 +4,36 @@
 #include <cstring>
 #include <memory>
 #include <ostream>
+#include <pthread.h>
 #include <random>
+#include <string>
 #include <thread>
 #include "mutexes.hpp"
 #include <sched.h>
 #include <iostream>
 #include <vector>
 #include <chrono>
-
-#define CLK_TYPE std::chrono::high_resolution_clock
+#include "utils.hpp"
 
 #define NLOCKS 1
 #define BENCH_NSECS 3
-#define ITERATIONS 1e5
+#define ITERATIONS 1e6
 int nthreads;
 
-std::atomic<bool> should_end;
 std::vector<std::unique_ptr<abstractLock>> vlocks;
-
-constexpr size_t buf_sz = (1ULL)<<34 / 8; // 8 GiB on doubles
-CACHE_ALIGNED volatile double *mem_empty[2];
 
 size_t val = 0;
 
-void thread_run(int cpu, std::chrono::time_point<CLK_TYPE> start)
+void thread_run(int cpu, timep_type start)
 {
-    // Create a cpu_set_t object representing a set of CPUs. Clear it and mark
-    // only CPU i as set.
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu, &cpuset);
-    int rc = pthread_setaffinity_np(pthread_self(),
-                                    sizeof(cpu_set_t), &cpuset);
-    if (rc != 0)
-        perror("Could not set affinity to thread");
+    set_thread_affinity(cpu, pthread_self());
 
-    std::random_device rd;  // a seed source for the random number engine
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<size_t> dist(0, NLOCKS-1);
+    RandGenerator rand(NLOCKS-1);
 
     std::this_thread::sleep_until(start);
     for (int i = 0; i < ITERATIONS; i++) {
-        size_t rand_idx = dist(gen);
+        size_t rand_idx = rand.generate();
+
         abstractLock& mtx = *vlocks[rand_idx];
         mtx.lock();
         val++;
@@ -53,51 +41,46 @@ void thread_run(int cpu, std::chrono::time_point<CLK_TYPE> start)
     }
 }
 
-void thread_copier(int cpu)
+void thread_copier(int cpu, volatile char *buf1, volatile char *buf2, size_t bufsize)
 {
-    // Create a cpu_set_t object representing a set of CPUs. Clear it and mark
-    // only CPU i as set.
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu, &cpuset);
-    int rc = pthread_setaffinity_np(pthread_self(),
-        sizeof(cpu_set_t), &cpuset);
-    if (rc != 0)
-        perror("Could not set affinity to thread");
+    set_thread_affinity(cpu, pthread_self());
 
-    int src = 0;
-    int dest = 0;
     double total_bytes = 0;
     auto total_time = std::chrono::nanoseconds(0);
     int copy_count = 0;
     
     while (val < ITERATIONS * nthreads) {
-        auto t1 = CLK_TYPE::now();
-        //std::memcpy(mem_empty[dest], mem_empty[src], buf_sz * 8);
-        for (size_t i = 0; i < buf_sz; i++) {
-            mem_empty[dest][i] = mem_empty[src][i];
+        auto t1 = now();
+        //std::memcpy(mem_empty[dest], mem_empty[src], buf_sz);
+        for (size_t i = 0; i < bufsize; i++) {
+            buf1[i] = buf2[i];
         }
-        auto t2 = CLK_TYPE::now();
+        auto t2 = now();
         
         auto copy_time = std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1);
         total_time += copy_time;
-        total_bytes += buf_sz * 8;
+        total_bytes += bufsize;
         copy_count++;
         
-        int tmp = src;
-        src = dest;
-        dest = tmp;
+        volatile char* tmp = buf1;
+        buf2 = buf1;
+        buf1 = tmp;
     }
     
     // Final bandwidth calculation
     if (copy_count > 0) {
         double avg_bandwidth_gbps = (total_bytes / 1e9) / (total_time.count() / 1e9);
-        std::cout << "Average memcpy bandwidth: " << avg_bandwidth_gbps << " GB/s" << std::endl;
+        std::cout << "Average memcpy bandwidth: " << avg_bandwidth_gbps << " GB/s - avg time per copy: " << total_time.count()/1e9/copy_count << " sec" << std::endl;
     }
 }
 
-int main ()
+int main (int argc, char** argv)
 {
+    // 4GiB by default
+    size_t bufsize = 1ULL<<32;
+    if (argc > 1)
+        bufsize = std::stoll(argv[1]);
+
     cpu_set_t proc_cpus;
     CPU_ZERO(&proc_cpus);
 
@@ -114,20 +97,23 @@ int main ()
     }
     std::cout << std::endl << std::flush;
 
-
-    mem_empty[0] = new double[buf_sz];
-    mem_empty[1] = new double[buf_sz];
-    for (size_t i = 0; i < buf_sz; i++) {
-        mem_empty[0][i] = static_cast<double>(i);
-        mem_empty[1][i] = static_cast<double>(i);
+    // Allocating and generating arrays 
+    std::cout << "Allocating and generating arrays (bytes="<< bufsize/(1ULL<<20) << "MiB each)..." << std::flush;
+    RandGenerator r(255);
+    char *buf1 = new char[bufsize];
+    char *buf2 = new char[bufsize];
+    for (size_t i = 0; i < bufsize; i++) {
+        buf1[i] = r.generate();
+        buf2[i] = r.generate();
     }
+    std::cout << "finished." << std::endl << std::flush;
 
     // First, allocate mutexes
     vlocks.reserve(NLOCKS);
     for (int i = 0; i < NLOCKS; i++)
         vlocks.push_back(TASLock::factory());
 
-    auto start = CLK_TYPE::now() + std::chrono::seconds(1);
+    auto start = now() + std::chrono::seconds(1);
 
     std::vector<std::thread> vthr;
     vthr.reserve(nthreads);
@@ -139,12 +125,13 @@ int main ()
         }
     }
 
-    std::thread copier(thread_copier, last_cpu+1);
+    std::thread copier(thread_copier, last_cpu+1, buf1, buf2, bufsize);
+    set_thread_affinity(last_cpu+2, pthread_self());
 
     for (int i = 0; i < nthreads; i++)
         vthr[i].join();
 
-    auto end = CLK_TYPE::now();
+    auto end = now();
     copier.join();
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
